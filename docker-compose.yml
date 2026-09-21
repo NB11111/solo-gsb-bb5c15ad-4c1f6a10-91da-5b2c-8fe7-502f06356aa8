@@ -1,0 +1,19 @@
+services:
+  calibration-api:
+    build: .
+    image: calibration-timeline-service:latest
+    container_name: calibration-api
+    ports:
+      - "8080:8080"
+    environment:
+      # All settings are optional and have sensible defaults.
+      CAL_HOST: "0.0.0.0"
+      CAL_PORT: "8080"
+      CAL_LOG_LEVEL: "info"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
