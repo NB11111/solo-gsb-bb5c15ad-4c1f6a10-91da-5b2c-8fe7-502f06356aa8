@@ -4,8 +4,11 @@ from app.engine import (
     BLOCKED,
     GROUNDED,
     INVALID,
+    Segment,
     build_timeline,
     classify_sensor,
+    compare_segments,
+    compare_sensor,
     evaluate_batch,
     query_sample,
 )
@@ -126,3 +129,66 @@ def test_query_sample_blocked_wins_over_grounded_and_skips_invalid():
     # A point covered only by invalid (cyclic) revisions is resolved normally.
     assert query_sample("S", 85, events, states, depths)["value"] == 0.0
     assert query_sample("S", 85, events, states, depths)["revision_id"] == "root"
+
+
+# ---------------------------------------------------------------------------
+# Cross-batch comparison
+# ---------------------------------------------------------------------------
+
+
+def test_compare_segments_merges_identical_payloads_across_revisions():
+    # Same effective value on both sides; revision provenance is ignored, so
+    # the left revision boundary at t=10 does not split the diff interval.
+    left = [
+        Segment(0, 10, "calibrated", 1.0, "u", "v1"),
+        Segment(10, 20, "calibrated", 1.0, "u", "v2"),
+    ]
+    right = [Segment(0, 20, "calibrated", 1.0, "u", "w1")]
+    intervals = compare_segments(left, right)
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in intervals] == [
+        (0, 20, "equal")
+    ]
+
+
+def test_compare_segments_scans_union_span_and_classifies_pairs():
+    left = [Segment(0, 10, "calibrated", 1.0, "u", "v1")]
+    right = [
+        Segment(5, 10, "withdrawn", None, None, "w1"),
+        Segment(20, 30, "calibrated", 1.0, "u", "w2"),
+    ]
+    intervals = compare_segments(left, right)
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in intervals] == [
+        (0, 5, "left_only"),
+        (5, 10, "state_mismatch"),
+        (10, 20, "equal"),  # both sides uncovered
+        (20, 30, "right_only"),
+    ]
+    assert intervals[1]["left"]["state"] == "calibrated"
+    assert intervals[1]["right"]["state"] == "withdrawn"
+    assert intervals[2]["left"] is None and intervals[2]["right"] is None
+
+
+def test_compare_segments_empty_both_sides():
+    assert compare_segments([], []) == []
+
+
+def test_compare_sensor_reports_blocked_and_invalid():
+    left = {
+        "root": _ev("root", "ROOT", 0, 10, value=1.0),
+        "orphan": _ev("orphan", "ghost", 0, 5, value=2.0),
+    }
+    right = {
+        "c1": _ev("c1", "c2", 0, 10, value=1.0),
+        "c2": _ev("c2", "c1", 0, 10, value=1.0),
+    }
+    doc = compare_sensor("L", "R", "S", left, right)
+    assert doc["incomplete"] is True
+    reasons = {(r["side"], r["reason"]) for r in doc["incomplete_reasons"]}
+    assert reasons == {("left", "gaps"), ("right", "invalid_revisions")}
+    gaps = next(r for r in doc["incomplete_reasons"] if r["reason"] == "gaps")
+    assert gaps["affected_revisions"] == ["orphan"]
+    assert gaps["missing_revision_ids"] == ["ghost"]
+    # Left grounded fold covers [0,10); the right fold is empty (cycle).
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in doc["intervals"]] == [
+        (0, 10, "left_only")
+    ]

@@ -4,7 +4,8 @@
 **乱序、时间重叠且可能撤回**的测量片段修订（measurement-fragment revisions），
 按照**版本因果关系**与**时间区间切分规则**，生成一条**确定性**的有效标定时间线；
 当修订引用了尚未上传的父版本时，返回**可补传的缺口清单（gaps）**；
-重复提交通过幂等键保证**幂等**。全部状态保存在**进程内存**中，可随时重置。
+重复提交通过幂等键保证**幂等**；还可对**两个批次的同一传感器**做
+**差异对比审计（compare）**。全部状态保存在**进程内存**中，可随时重置。
 
 ---
 
@@ -89,6 +90,10 @@ pytest -q
   `blocked`（补传缺失祖先可能改变折叠赢家），并在 `missing_ancestors`
   中按字典序列出沿父链追溯到的、尚未上传的末端祖先，可直接照单补传。
   成环（invalid）修订不影响采样判定。
+- **跨批次对比**（见 4.4）复用同一套确定性折叠结果：对两个批次中同一
+  传感器的有效时间线做半开区间差异扫描，只比较有效状态
+  （`state`/`value`/`unit`），与修订来源（revision_id）及到达顺序无关；
+  任一侧存在缺口或成环修订时标记 `incomplete` 并给出原因。
 
 ---
 
@@ -181,6 +186,61 @@ $ curl -s 'localhost:8080/api/v1/batches/B42/sensors/S1/sample?timestamp_ns=150'
 }
 ```
 
+### `GET /api/v1/batches/compare?left_batch_id=...&right_batch_id=...&sensor_id=...` — 跨批次对比审计
+
+对**同一传感器**在两个批次中的有效时间线（复用第 3 节的确定性折叠结果）
+做半开区间差异扫描。`intervals` 是两侧覆盖范围并集 `[min_start, max_end)`
+的**连续、按时间排序的分区**：每个区间带 `kind` 以及两侧各自的有效负载
+（`state`/`value`/`unit`，未覆盖的一侧为 `null`）；`kind` 与两侧负载完全
+相同的相邻区间会被合并（合并与折叠片段的修订来源边界无关）。
+
+| `kind`           | 含义                                                              |
+| ---------------- | ----------------------------------------------------------------- |
+| `equal`          | 两侧有效状态一致（都未覆盖也算一致，此时两侧负载均为 `null`）      |
+| `left_only`      | 仅左批次覆盖该区间                                                 |
+| `right_only`     | 仅右批次覆盖该区间                                                 |
+| `value_mismatch` | 两侧均为 `calibrated`，但 `value` 或 `unit` 不同                   |
+| `state_mismatch` | 一侧为 `calibrated`、另一侧为 `withdrawn`                          |
+
+响应还包含：
+
+- `left_segments_hash` / `right_segments_hash`：两侧折叠片段的内容哈希，
+  与批次结果中的 `segments_hash` 一致，便于交叉校验；
+- `incomplete` 与 `incomplete_reasons`：任一侧存在缺口（修订 blocked，
+  `reason="gaps"`，含可补传的 `missing_revision_ids`）或成环修订
+  （`reason="invalid_revisions"`）时 `incomplete=true`——补传后差异结果
+  可能改变；差异本身仍按当前已落地的部分计算。
+
+参数缺失或为空返回 `422`；任一批次不存在、或传感器在任一批次中不存在
+返回 `404`。
+
+示例（B42 与 B43 的 S1：B42 为 [0,300)=1.0 且 [100,200)=3.5，B43 整体为
+[0,300)=1.0）：
+
+```bash
+$ curl -s 'localhost:8080/api/v1/batches/compare?left_batch_id=B42&right_batch_id=B43&sensor_id=S1'
+{
+  "sensor_id": "S1",
+  "left_batch_id": "B42",
+  "right_batch_id": "B43",
+  "left_segments_hash": "…",
+  "right_segments_hash": "…",
+  "incomplete": false,
+  "incomplete_reasons": [],
+  "intervals": [
+    {"start_ns": 0, "end_ns": 100, "kind": "equal",
+     "left": {"state": "calibrated", "value": 1.0, "unit": "C"},
+     "right": {"state": "calibrated", "value": 1.0, "unit": "C"}},
+    {"start_ns": 100, "end_ns": 200, "kind": "value_mismatch",
+     "left": {"state": "calibrated", "value": 3.5, "unit": "C"},
+     "right": {"state": "calibrated", "value": 1.0, "unit": "C"}},
+    {"start_ns": 200, "end_ns": 300, "kind": "equal",
+     "left": {"state": "calibrated", "value": 1.0, "unit": "C"},
+     "right": {"state": "calibrated", "value": 1.0, "unit": "C"}}
+  ]
+}
+```
+
 ### `POST /admin/reset` — 清空全部内存状态
 
 返回被清除的批次数与事件数。
@@ -232,12 +292,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / result / sample / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、采样点查询、缺口与哈希（纯函数引擎）
+│   ├── main.py       # FastAPI 路由：ingest / result / sample / compare / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、采样点查询、跨批次差异对比、缺口与哈希（纯函数引擎）
 │   ├── storage.py    # 线程安全的内存存储与幂等判定
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 32 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 49 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

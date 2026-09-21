@@ -121,6 +121,65 @@ class SamplePointResponse(StrictModel):
     missing_ancestors: list[str] = Field(default_factory=list)
 
 
+class CompareSide(StrictModel):
+    """Effective folded state one side contributes to a compare interval."""
+
+    state: Literal["calibrated", "withdrawn"]
+    # Populated for calibrated spans; null on withdrawn (erased) spans.
+    value: Optional[float] = None
+    unit: Optional[str] = None
+
+
+class CompareInterval(StrictModel):
+    """One half-open diff interval over the union of both folded timelines."""
+
+    start_ns: int
+    end_ns: int
+    # equal:          both sides agree (both uncovered counts as agreement);
+    # left_only:      only the left batch covers the span;
+    # right_only:     only the right batch covers the span;
+    # value_mismatch: both calibrated but value or unit differ;
+    # state_mismatch: one side calibrated, the other withdrawn.
+    kind: Literal["equal", "left_only", "right_only", "value_mismatch", "state_mismatch"]
+    # Effective payload of each side on this span; null where uncovered.
+    left: Optional[CompareSide] = None
+    right: Optional[CompareSide] = None
+
+
+class IncompleteReason(StrictModel):
+    """Why one side of a comparison cannot be considered final yet."""
+
+    side: Literal["left", "right"]
+    batch_id: str
+    # gaps:              revisions blocked by not-yet-uploaded ancestors;
+    # invalid_revisions: revisions in or below a parent cycle.
+    reason: Literal["gaps", "invalid_revisions"]
+    detail: str
+    # Blocked or invalid revisions excluded from the fold (sorted).
+    affected_revisions: list[str] = Field(default_factory=list)
+    # For reason="gaps": distinct missing parents to backfill (sorted).
+    missing_revision_ids: list[str] = Field(default_factory=list)
+
+
+class CompareResponse(StrictModel):
+    """Half-open interval diff of one sensor across two batches."""
+
+    sensor_id: str
+    left_batch_id: str
+    right_batch_id: str
+    # Hashes of each side's folded segments (matching the per-sensor
+    # segments_hash of the batch result) for cross-checking.
+    left_segments_hash: str
+    right_segments_hash: str
+    # True when either side has gaps or invalid revisions, so backfilling
+    # may still change the diff.
+    incomplete: bool
+    incomplete_reasons: list[IncompleteReason] = Field(default_factory=list)
+    # Contiguous, time-sorted partition of the union coverage span;
+    # adjacent intervals merge when kind and both side payloads match.
+    intervals: list[CompareInterval] = Field(default_factory=list)
+
+
 class IngestResponse(StrictModel):
     status: Literal["accepted", "duplicate", "conflict"]
     idempotency_key: str

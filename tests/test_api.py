@@ -306,3 +306,215 @@ def test_sample_unknown_batch_or_sensor_404(client):
 def test_sample_rejects_negative_timestamp(client):
     r = client.get("/api/v1/batches/B1/sensors/S1/sample", params={"timestamp_ns": -1})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Cross-batch comparison
+# ---------------------------------------------------------------------------
+
+
+def _compare(client, left="L", right="R", sensor="S1"):
+    return client.get(
+        "/api/v1/batches/compare",
+        params={
+            "left_batch_id": left,
+            "right_batch_id": right,
+            "sensor_id": sensor,
+        },
+    )
+
+
+def test_compare_identical_batches_all_equal(client):
+    for batch in ("L", "R"):
+        _post(client, _event("v1", "ROOT", 0, 100, value=1.0, batch=batch), batch=batch)
+        _post(client, _event("v2", "v1", 10, 20, value=2.0, batch=batch), batch=batch)
+    r = _compare(client)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["sensor_id"] == "S1"
+    assert body["left_batch_id"] == "L" and body["right_batch_id"] == "R"
+    assert body["incomplete"] is False
+    assert body["incomplete_reasons"] == []
+    assert body["left_segments_hash"] == body["right_segments_hash"]
+    # Distinct values keep interval boundaries even within one kind.
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 10, "equal"),
+        (10, 20, "equal"),
+        (20, 100, "equal"),
+    ]
+
+
+def test_compare_merges_adjacent_intervals_across_revision_boundaries(client):
+    # Left folds to two segments (different revisions, same effective value);
+    # right folds to one. The diff merges them into a single equal interval.
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="L"), batch="L")
+    _post(client, _event("v2", "v1", 10, 20, value=1.0, batch="L"), batch="L")
+    _post(client, _event("w1", "ROOT", 0, 20, value=1.0, batch="R"), batch="R")
+    body = _compare(client).json()
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 20, "equal")
+    ]
+    assert body["intervals"][0]["left"] == {"state": "calibrated", "value": 1.0, "unit": "mm"}
+    assert body["intervals"][0]["right"] == {"state": "calibrated", "value": 1.0, "unit": "mm"}
+
+
+def test_compare_value_mismatch(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0, batch="L"), batch="L")
+    _post(client, _event("v1", "ROOT", 0, 100, value=2.0, batch="R"), batch="R")
+    body = _compare(client).json()
+    [interval] = body["intervals"]
+    assert (interval["start_ns"], interval["end_ns"], interval["kind"]) == (
+        0,
+        100,
+        "value_mismatch",
+    )
+    assert interval["left"]["value"] == 1.0
+    assert interval["right"]["value"] == 2.0
+
+
+def test_compare_unit_mismatch_counts_as_value_mismatch(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, unit="mm", batch="L"), batch="L")
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, unit="C", batch="R"), batch="R")
+    body = _compare(client).json()
+    assert [i["kind"] for i in body["intervals"]] == ["value_mismatch"]
+
+
+def test_compare_state_mismatch(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0, batch="L"), batch="L")
+    _post(
+        client,
+        _event("w1", "ROOT", 0, 100, withdrawn=True, value=None, batch="R"),
+        batch="R",
+    )
+    body = _compare(client).json()
+    [interval] = body["intervals"]
+    assert interval["kind"] == "state_mismatch"
+    assert interval["left"]["state"] == "calibrated"
+    assert interval["right"] == {"state": "withdrawn", "value": None, "unit": None}
+
+
+def test_compare_left_only_right_only_and_both_uncovered(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="L"), batch="L")
+    _post(client, _event("w1", "ROOT", 20, 30, value=2.0, batch="R"), batch="R")
+    body = _compare(client).json()
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 10, "left_only"),
+        (10, 20, "equal"),
+        (20, 30, "right_only"),
+    ]
+    left_only, both_uncovered, right_only = body["intervals"]
+    assert left_only["left"]["value"] == 1.0 and left_only["right"] is None
+    # Both sides uncovered counts as agreement, keeping the partition contiguous.
+    assert both_uncovered["left"] is None and both_uncovered["right"] is None
+    assert right_only["left"] is None and right_only["right"]["value"] == 2.0
+
+
+def test_compare_mixed_intervals_sorted_and_not_overmerged(client):
+    # L: [0,10)=1.0 [10,20)=2.0 ; R: [0,5)=1.0 [5,15)=withdrawn [15,25)=2.0
+    _post(client, _event("v1", "ROOT", 0, 20, value=1.0, batch="L"), batch="L")
+    _post(client, _event("v2", "v1", 10, 20, value=2.0, batch="L"), batch="L")
+    _post(client, _event("w1", "ROOT", 0, 5, value=1.0, batch="R"), batch="R")
+    _post(
+        client,
+        _event("w2", "w1", 5, 15, withdrawn=True, value=None, batch="R"),
+        batch="R",
+    )
+    _post(client, _event("w3", "w2", 15, 25, value=2.0, batch="R"), batch="R")
+    body = _compare(client).json()
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 5, "equal"),
+        (5, 10, "state_mismatch"),
+        # Same kind as the previous interval but different left payload: no merge.
+        (10, 15, "state_mismatch"),
+        (15, 20, "equal"),
+        (20, 25, "right_only"),
+    ]
+
+
+def test_compare_incomplete_reports_gaps(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0, batch="L"), batch="L")
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0, batch="R"), batch="R")
+    _post(client, _event("v2", "missing", 0, 50, value=9.0, batch="R"), batch="R")
+    body = _compare(client).json()
+    assert body["incomplete"] is True
+    [reason] = body["incomplete_reasons"]
+    assert reason["side"] == "right"
+    assert reason["batch_id"] == "R"
+    assert reason["reason"] == "gaps"
+    assert reason["affected_revisions"] == ["v2"]
+    assert reason["missing_revision_ids"] == ["missing"]
+    # The diff itself is still computed from the grounded folds.
+    assert [i["kind"] for i in body["intervals"]] == ["equal"]
+
+
+def test_compare_incomplete_reports_invalid_cycle(client):
+    _post(client, _event("c1", "c2", 0, 10, value=1.0, batch="L", key="c1"), batch="L")
+    _post(client, _event("c2", "c1", 0, 10, value=2.0, batch="L", key="c2"), batch="L")
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="R"), batch="R")
+    body = _compare(client).json()
+    assert body["incomplete"] is True
+    [reason] = body["incomplete_reasons"]
+    assert reason["side"] == "left"
+    assert reason["reason"] == "invalid_revisions"
+    assert reason["affected_revisions"] == ["c1", "c2"]
+    assert reason["missing_revision_ids"] == []
+    # The left fold is empty (cycle excluded), so coverage is right-only.
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 10, "right_only")
+    ]
+
+
+def test_compare_deterministic_regardless_of_arrival_order(client):
+    left_events = [
+        _event("r", "ROOT", 0, 100, value=1.0, batch="L", key="lr"),
+        _event("a", "r", 0, 50, value=2.0, batch="L", key="la"),
+        _event("b", "r", 25, 75, value=3.0, batch="L", key="lb"),
+    ]
+    right_events = [
+        _event("r", "ROOT", 0, 100, value=1.0, batch="R", key="rr"),
+        _event("a", "r", 0, 50, value=2.0, batch="R", key="ra"),
+        _event("b", "r", 25, 75, value=3.0, batch="R", key="rb"),
+    ]
+    for e in left_events:
+        _post(client, e, batch="L")
+    for e in reversed(right_events):
+        _post(client, e, batch="R")
+    body = _compare(client).json()
+    assert body["left_segments_hash"] == body["right_segments_hash"]
+    assert {i["kind"] for i in body["intervals"]} == {"equal"}
+
+
+def test_compare_batch_with_itself_is_all_equal(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="L"), batch="L")
+    body = _compare(client, left="L", right="L").json()
+    assert [i["kind"] for i in body["intervals"]] == ["equal"]
+    assert body["incomplete"] is False
+
+
+def test_compare_unknown_batch_or_sensor_404(client):
+    assert _compare(client).status_code == 404
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="L"), batch="L")
+    # Right batch does not exist yet.
+    r = _compare(client)
+    assert r.status_code == 404
+    assert "'R'" in r.json()["detail"]
+    # Sensor S1 unknown in the right batch (only SX there).
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="R", sensor="SX"), batch="R")
+    r = _compare(client)
+    assert r.status_code == 404
+    assert "S1" in r.json()["detail"] and "'R'" in r.json()["detail"]
+    # Sensor SX unknown in the left batch.
+    r = _compare(client, sensor="SX")
+    assert r.status_code == 404
+    assert "SX" in r.json()["detail"] and "'L'" in r.json()["detail"]
+
+
+def test_compare_invalid_params_422(client):
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="L"), batch="L")
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, batch="R"), batch="R")
+    # Missing query parameters.
+    assert client.get("/api/v1/batches/compare").status_code == 422
+    # Empty identifiers.
+    assert _compare(client, left="").status_code == 422
+    assert _compare(client, right="").status_code == 422
+    assert _compare(client, sensor="").status_code == 422
