@@ -4,10 +4,14 @@ from app.engine import (
     BLOCKED,
     GROUNDED,
     INVALID,
+    Segment,
     build_timeline,
     classify_sensor,
+    diff_timelines,
     evaluate_batch,
+    evaluate_compare,
     query_sample,
+    sensor_known,
 )
 from app.storage import BatchStore, StoredEvent
 
@@ -126,3 +130,94 @@ def test_query_sample_blocked_wins_over_grounded_and_skips_invalid():
     # A point covered only by invalid (cyclic) revisions is resolved normally.
     assert query_sample("S", 85, events, states, depths)["value"] == 0.0
     assert query_sample("S", 85, events, states, depths)["revision_id"] == "root"
+
+
+# ---------------------------------------------------------------------------
+# Cross-batch diff scan
+# ---------------------------------------------------------------------------
+
+
+def _seg(start, end, state="calibrated", value=1.0, unit="u", rev="r"):
+    return Segment(
+        start_ns=start,
+        end_ns=end,
+        state=state,
+        value=None if state == "withdrawn" else float(value),
+        unit=None if state == "withdrawn" else unit,
+        revision_id=rev,
+    )
+
+
+def test_diff_timelines_classifies_all_kinds():
+    left = [
+        _seg(0, 10, value=1.0),
+        _seg(10, 20, value=2.0),
+        _seg(20, 30, state="withdrawn"),
+        _seg(30, 40, value=4.0),
+        _seg(50, 60, value=5.0),
+    ]
+    right = [
+        _seg(0, 10, value=1.0, rev="x"),
+        _seg(10, 20, value=9.0, rev="x"),
+        _seg(20, 30, value=3.0, rev="x"),
+        _seg(30, 40, state="withdrawn", rev="x"),
+        _seg(40, 50, value=5.0, rev="x"),
+    ]
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in diff_timelines(left, right)] == [
+        (0, 10, "equal"),
+        (10, 20, "value_mismatch"),
+        (20, 30, "state_mismatch"),
+        (30, 40, "state_mismatch"),
+        (40, 50, "right_only"),
+        (50, 60, "left_only"),
+    ]
+
+
+def test_diff_timelines_merges_only_identical_payloads():
+    # Same kind on both sides of the boundary at 10, but the right payload
+    # changes value -> no merge across the boundary.
+    left = [_seg(0, 20, value=1.0)]
+    right = [_seg(0, 10, value=2.0, rev="a"), _seg(10, 20, value=3.0, rev="b")]
+    kinds = [(i["start_ns"], i["end_ns"], i["kind"]) for i in diff_timelines(left, right)]
+    assert kinds == [(0, 10, "value_mismatch"), (10, 20, "value_mismatch")]
+
+    # Identical observable payloads on both sides -> merged into one span.
+    merged = diff_timelines(
+        [_seg(0, 10, value=1.0, rev="p"), _seg(10, 20, value=1.0, rev="q")],
+        [_seg(0, 20, value=1.0, rev="x")],
+    )
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in merged] == [(0, 20, "equal")]
+
+
+def test_diff_timelines_empty_and_one_sided():
+    assert diff_timelines([], []) == []
+    only_left = diff_timelines([_seg(0, 5)], [])
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in only_left] == [
+        (0, 5, "left_only")
+    ]
+    assert only_left[0]["right"] is None
+
+
+def test_evaluate_compare_reports_gaps_and_invalid_per_side():
+    left_store = BatchStore()
+    for e in [
+        _ev("root", "ROOT", 0, 10, value=1.0, batch="BL"),
+        _ev("orphan", "ghost", 0, 10, value=2.0, batch="BL"),
+    ]:
+        left_store.events[e.revision_id] = e
+    right_store = BatchStore()
+    for e in [
+        _ev("root", "ROOT", 0, 10, value=1.0, batch="BR"),
+        _ev("c1", "c2", 0, 5, batch="BR"),
+        _ev("c2", "c1", 0, 5, batch="BR"),
+    ]:
+        right_store.events[e.revision_id] = e
+
+    assert sensor_known(left_store, "S") and not sensor_known(left_store, "ZZ")
+    doc = evaluate_compare("BL", "BR", "S", left_store, right_store)
+    assert doc["incomplete"] is True
+    reasons = {(r["side"], r["reason"]) for r in doc["incomplete_reasons"]}
+    assert reasons == {("left", "gaps"), ("right", "invalid_revisions")}
+    assert doc["intervals"][0]["kind"] == "equal"
+    assert doc["differs"] is False
+    assert doc["left_segments_hash"] == doc["right_segments_hash"]

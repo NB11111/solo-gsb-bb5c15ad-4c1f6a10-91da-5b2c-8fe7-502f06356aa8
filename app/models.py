@@ -130,6 +130,67 @@ class IngestResponse(StrictModel):
     result: BatchResult
 
 
+class CompareSide(StrictModel):
+    """Observable effective state of one side of a compared interval."""
+
+    state: Literal["calibrated", "withdrawn"]
+    # Populated for calibrated spans; null on withdrawn (erased) spans.
+    value: Optional[float] = None
+    unit: Optional[str] = None
+
+
+class CompareInterval(StrictModel):
+    """One half-open span of the cross-batch diff scan."""
+
+    start_ns: int
+    end_ns: int
+    # equal:          both sides agree (or neither covers the span);
+    # left_only:      only the left batch covers the span;
+    # right_only:     only the right batch covers the span;
+    # value_mismatch: both calibrated but value/unit differ;
+    # state_mismatch: one side calibrated, the other withdrawn.
+    kind: Literal[
+        "equal", "left_only", "right_only", "value_mismatch", "state_mismatch"
+    ]
+    # Observable state per side; null where that batch does not cover the span.
+    left: Optional[CompareSide] = None
+    right: Optional[CompareSide] = None
+
+
+class IncompleteReason(StrictModel):
+    """One reason why a comparison may still change after backfills."""
+
+    side: Literal["left", "right"]
+    batch_id: str
+    # gaps:              the sensor has blocked revisions waiting on missing
+    #                    parents (listed in missing_revision_ids);
+    # invalid_revisions: the sensor has revisions in parent cycles.
+    reason: Literal["gaps", "invalid_revisions"]
+    missing_revision_ids: list[str] = Field(default_factory=list)
+    awaited_by: list[str] = Field(default_factory=list)
+    invalid_revision_ids: list[str] = Field(default_factory=list)
+
+
+class BatchCompareResponse(StrictModel):
+    """Deterministic diff of one sensor's effective timeline in two batches."""
+
+    left_batch_id: str
+    right_batch_id: str
+    sensor_id: str
+    # Time-sorted, adjacency-merged half-open intervals covering the union of
+    # both timelines' ranges.
+    intervals: list[CompareInterval]
+    # True when at least one interval is not "equal".
+    differs: bool
+    # True when either side has gaps or invalid revisions for this sensor.
+    incomplete: bool
+    incomplete_reasons: list[IncompleteReason]
+    # Content hashes of each side's folded segments (provenance included), for
+    # exact timeline-identity checks.
+    left_segments_hash: str
+    right_segments_hash: str
+
+
 class ResetResponse(StrictModel):
     status: Literal["reset"]
     batches_removed: int

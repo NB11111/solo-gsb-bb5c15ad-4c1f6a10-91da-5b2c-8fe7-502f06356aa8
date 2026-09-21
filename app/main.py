@@ -1,4 +1,4 @@
-"""FastAPI application: ingest, timeline/sample query and reset endpoints."""
+"""FastAPI application: ingest, timeline/sample query, batch compare and reset."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import get_settings
-from .engine import evaluate_batch, evaluate_sample
+from .engine import evaluate_batch, evaluate_compare, evaluate_sample, sensor_known
 from .models import (
+    BatchCompareResponse,
     BatchResult,
     HealthResponse,
     IngestResponse,
@@ -151,6 +152,43 @@ def get_sample(
             detail=f"sensor {sensor_id!r} not found in batch {batch_id!r}",
         )
     return SamplePointResponse(**doc)
+
+
+@app.get(
+    "/api/v1/batches/compare",
+    response_model=BatchCompareResponse,
+    tags=["calibration"],
+    summary="Compare one sensor's effective timeline across two batches",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def compare_batches(
+    left_batch_id: str = Query(..., min_length=1, max_length=200),
+    right_batch_id: str = Query(..., min_length=1, max_length=200),
+    sensor_id: str = Query(..., min_length=1, max_length=200),
+) -> BatchCompareResponse:
+    left = store.get_batch(left_batch_id)
+    if left is None or not left.events:
+        raise HTTPException(
+            status_code=404, detail=f"batch {left_batch_id!r} not found"
+        )
+    right = store.get_batch(right_batch_id)
+    if right is None or not right.events:
+        raise HTTPException(
+            status_code=404, detail=f"batch {right_batch_id!r} not found"
+        )
+    with store.lock:
+        if not sensor_known(left, sensor_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"sensor {sensor_id!r} not found in batch {left_batch_id!r}",
+            )
+        if not sensor_known(right, sensor_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"sensor {sensor_id!r} not found in batch {right_batch_id!r}",
+            )
+        doc = evaluate_compare(left_batch_id, right_batch_id, sensor_id, left, right)
+    return BatchCompareResponse(**doc)
 
 
 @app.post(

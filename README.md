@@ -89,6 +89,15 @@ pytest -q
   `blocked`（补传缺失祖先可能改变折叠赢家），并在 `missing_ancestors`
   中按字典序列出沿父链追溯到的、尚未上传的末端祖先，可直接照单补传。
   成环（invalid）修订不影响采样判定。
+- **批次对比审计**（见 4.4）对两个批次中**同一传感器**的折叠时间线做
+  半开区间差异扫描：取两侧所有片段端点作为切点，对每个原子区间分类为
+  `equal` / `left_only` / `right_only` / `value_mismatch` / `state_mismatch`，
+  按时间排序输出；相邻且**类型与两侧可观测负载（state/value/unit）完全相同**
+  的区间会被合并（来源修订不同不保留边界——对比只关心可观测结果，
+  不比较 `revision_id` 谱系；两侧均未覆盖的空洞计为 `equal`，两侧负载均为
+  `null`）。若任一一侧该传感器存在缺口（blocked）或成环（invalid）修订，
+  响应中 `incomplete=true` 并在 `incomplete_reasons` 中按侧列出原因
+  （缺失父版本清单或 invalid 修订清单），因为补传/修复后对应时间线仍可能变化。
 
 ---
 

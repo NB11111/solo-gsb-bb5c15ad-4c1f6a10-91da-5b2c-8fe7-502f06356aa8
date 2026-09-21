@@ -21,6 +21,14 @@ GROUNDED = "grounded"
 BLOCKED = "blocked"
 INVALID = "invalid"
 
+# Batch-comparison interval kinds (observable outcome of the half-open diff
+# scan at every instant of the union of both covered ranges).
+DIFF_EQUAL = "equal"
+DIFF_LEFT_ONLY = "left_only"
+DIFF_RIGHT_ONLY = "right_only"
+DIFF_VALUE_MISMATCH = "value_mismatch"
+DIFF_STATE_MISMATCH = "state_mismatch"
+
 
 @dataclass(frozen=True)
 class Segment:
@@ -245,6 +253,82 @@ def collect_gaps(
 
 
 # ---------------------------------------------------------------------------
+# Batch comparison (half-open interval diff scan)
+# ---------------------------------------------------------------------------
+
+
+def _side_payload(seg: Optional[Segment]) -> Optional[dict]:
+    """Observable state of one side; ``None`` when that side does not cover."""
+    if seg is None:
+        return None
+    return {"state": seg.state, "value": seg.value, "unit": seg.unit}
+
+
+def _diff_kind(left: Optional[Segment], right: Optional[Segment]) -> str:
+    """Classify one instant given the segments covering it on each side.
+
+    Provenance (``revision_id``) is deliberately not compared: two batches
+    that converged to the same observable timeline via different revision
+    histories are ``equal``. Spans covered by neither side are ``equal``
+    with both payloads null.
+    """
+    if left is None:
+        return DIFF_EQUAL if right is None else DIFF_RIGHT_ONLY
+    if right is None:
+        return DIFF_LEFT_ONLY
+    if left.state != right.state:
+        return DIFF_STATE_MISMATCH
+    if left.state == "withdrawn":
+        return DIFF_EQUAL  # tombstones carry no value payload
+    return (
+        DIFF_EQUAL
+        if left.value == right.value and left.unit == right.unit
+        else DIFF_VALUE_MISMATCH
+    )
+
+
+def diff_timelines(left: list[Segment], right: list[Segment]) -> list[dict]:
+    """Diff two folded timelines into time-sorted, merged half-open intervals.
+
+    Every atomic span between two consecutive segment boundaries of either
+    timeline is classified (see :func:`_diff_kind`); adjacent spans with the
+    same kind and identical observable payloads on both sides are merged, so
+    provenance-only boundaries inside one timeline do not fragment the diff.
+    """
+    bounds = sorted(
+        {s.start_ns for s in left}
+        | {s.end_ns for s in left}
+        | {s.start_ns for s in right}
+        | {s.end_ns for s in right}
+    )
+    intervals: list[dict] = []
+    li = ri = 0
+    for lo, hi in zip(bounds, bounds[1:]):
+        while li < len(left) and left[li].end_ns <= lo:
+            li += 1
+        while ri < len(right) and right[ri].end_ns <= lo:
+            ri += 1
+        lseg = left[li] if li < len(left) and left[li].start_ns <= lo else None
+        rseg = right[ri] if ri < len(right) and right[ri].start_ns <= lo else None
+        kind = _diff_kind(lseg, rseg)
+        lp = _side_payload(lseg)
+        rp = _side_payload(rseg)
+        if (
+            intervals
+            and intervals[-1]["end_ns"] == lo
+            and intervals[-1]["kind"] == kind
+            and intervals[-1]["left"] == lp
+            and intervals[-1]["right"] == rp
+        ):
+            intervals[-1]["end_ns"] = hi
+        else:
+            intervals.append(
+                {"start_ns": lo, "end_ns": hi, "kind": kind, "left": lp, "right": rp}
+            )
+    return intervals
+
+
+# ---------------------------------------------------------------------------
 # Hashing / serialization
 # ---------------------------------------------------------------------------
 
@@ -289,6 +373,11 @@ def group_by_sensor(store: BatchStore) -> dict[str, dict[str, StoredEvent]]:
     for event in store.events.values():
         by_sensor.setdefault(event.sensor_id, {})[event.revision_id] = event
     return by_sensor
+
+
+def sensor_known(store: BatchStore, sensor_id: str) -> bool:
+    """True when the batch holds at least one revision of ``sensor_id``."""
+    return any(event.sensor_id == sensor_id for event in store.events.values())
 
 
 def _parent_chain(revision_id: str, events: dict[str, StoredEvent]) -> list[str]:
@@ -439,4 +528,93 @@ def evaluate_batch(batch_id: str, store: BatchStore) -> dict:
         "revisions_invalid": totals[INVALID],
         "complete": not gaps_out and totals[INVALID] == 0 and revisions_total > 0,
         "timeline_hash": timeline_hash,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Batch comparison orchestration
+# ---------------------------------------------------------------------------
+
+
+def _sensor_fold(
+    batch_id: str, sensor_id: str, store: BatchStore
+) -> tuple[list[Segment], list[dict], list[str]]:
+    """Fold one sensor of one batch: ``(segments, gaps, invalid_revision_ids)``.
+
+    Precondition: the sensor is present in ``store`` (see :func:`sensor_known`).
+    """
+    sensor_events = group_by_sensor(store)[sensor_id]
+    states, depths = classify_sensor(sensor_events)
+    grounded_events = [
+        e for e in sensor_events.values() if states[e.revision_id] == GROUNDED
+    ]
+    segments = build_timeline(grounded_events, depths)
+    gaps = collect_gaps(batch_id, sensor_events, states)
+    invalid = sorted(rev for rev, state in states.items() if state == INVALID)
+    return segments, gaps, invalid
+
+
+def evaluate_compare(
+    left_batch_id: str,
+    right_batch_id: str,
+    sensor_id: str,
+    left_store: BatchStore,
+    right_store: BatchStore,
+) -> dict:
+    """Compute the deterministic comparison document for one sensor across two
+    batches.
+
+    The diff reuses each side's folded effective timeline as-is; pending
+    backfills (gaps) or cyclic (invalid) revisions on either side are reported
+    as ``incomplete_reasons`` because resolving them could still change the
+    corresponding timeline. Precondition: ``sensor_id`` is known in both
+    stores (see :func:`sensor_known`).
+    """
+    left_segments, left_gaps, left_invalid = _sensor_fold(
+        left_batch_id, sensor_id, left_store
+    )
+    right_segments, right_gaps, right_invalid = _sensor_fold(
+        right_batch_id, sensor_id, right_store
+    )
+
+    intervals = diff_timelines(left_segments, right_segments)
+
+    reasons: list[dict] = []
+    for side, batch_id, gaps, invalid in (
+        ("left", left_batch_id, left_gaps, left_invalid),
+        ("right", right_batch_id, right_gaps, right_invalid),
+    ):
+        if gaps:
+            reasons.append(
+                {
+                    "side": side,
+                    "batch_id": batch_id,
+                    "reason": "gaps",
+                    "missing_revision_ids": [g["missing_revision_id"] for g in gaps],
+                    "awaited_by": sorted({c for g in gaps for c in g["awaited_by"]}),
+                    "invalid_revision_ids": [],
+                }
+            )
+        if invalid:
+            reasons.append(
+                {
+                    "side": side,
+                    "batch_id": batch_id,
+                    "reason": "invalid_revisions",
+                    "missing_revision_ids": [],
+                    "awaited_by": [],
+                    "invalid_revision_ids": invalid,
+                }
+            )
+
+    return {
+        "left_batch_id": left_batch_id,
+        "right_batch_id": right_batch_id,
+        "sensor_id": sensor_id,
+        "intervals": intervals,
+        "differs": any(i["kind"] != DIFF_EQUAL for i in intervals),
+        "incomplete": bool(reasons),
+        "incomplete_reasons": reasons,
+        "left_segments_hash": hash_segments(left_segments),
+        "right_segments_hash": hash_segments(right_segments),
     }

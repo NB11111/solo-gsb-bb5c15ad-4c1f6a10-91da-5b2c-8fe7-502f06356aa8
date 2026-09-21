@@ -306,3 +306,260 @@ def test_sample_unknown_batch_or_sensor_404(client):
 def test_sample_rejects_negative_timestamp(client):
     r = client.get("/api/v1/batches/B1/sensors/S1/sample", params={"timestamp_ns": -1})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Cross-batch comparison
+# ---------------------------------------------------------------------------
+
+
+def _compare(client, left="BL", right="BR", sensor="S1"):
+    return client.get(
+        "/api/v1/batches/compare",
+        params={"left_batch_id": left, "right_batch_id": right, "sensor_id": sensor},
+    )
+
+
+def _post_to(client, event, batch):
+    """Post an event whose body batch_id is aligned with the path batch."""
+    return _post(client, {**event, "batch_id": batch}, batch=batch)
+
+
+def test_compare_identical_timelines_are_all_equal(client):
+    _post_to(client, _event("v1", "ROOT", 0, 100, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("v2", "v1", 10, 20, value=2.0, key="kl2"), "BL")
+    # Different revision ids/history, same observable timeline.
+    _post_to(client, _event("w1", "ROOT", 0, 100, value=1.0, key="kr1"), "BR")
+    _post_to(client, _event("w2", "w1", 10, 20, value=2.0, key="kr2"), "BR")
+
+    r = _compare(client)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["left_batch_id"] == "BL" and body["right_batch_id"] == "BR"
+    assert body["sensor_id"] == "S1"
+    assert body["differs"] is False
+    assert body["incomplete"] is False
+    assert body["incomplete_reasons"] == []
+    assert [i["kind"] for i in body["intervals"]] == ["equal"] * 3
+    assert [(i["start_ns"], i["end_ns"]) for i in body["intervals"]] == [
+        (0, 10),
+        (10, 20),
+        (20, 100),
+    ]
+    mid = body["intervals"][1]
+    assert mid["left"] == {"state": "calibrated", "value": 2.0, "unit": "mm"}
+    assert mid["right"] == {"state": "calibrated", "value": 2.0, "unit": "mm"}
+    # Provenance differs, so the exact-identity hashes differ too.
+    assert body["left_segments_hash"] != body["right_segments_hash"]
+
+
+def test_compare_merges_adjacent_equal_across_revision_boundaries(client):
+    # Left keeps a provenance boundary at 10 (v1 -> v2, same value); the diff
+    # must merge the two equal spans into one interval.
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("v2", "v1", 10, 20, value=1.0, key="kl2"), "BL")
+    _post_to(client, _event("w1", "ROOT", 0, 20, value=1.0, key="kr1"), "BR")
+
+    body = _compare(client).json()
+    assert body["intervals"] == [
+        {
+            "start_ns": 0,
+            "end_ns": 20,
+            "kind": "equal",
+            "left": {"state": "calibrated", "value": 1.0, "unit": "mm"},
+            "right": {"state": "calibrated", "value": 1.0, "unit": "mm"},
+        }
+    ]
+    assert body["differs"] is False
+
+
+def test_compare_left_only_right_only_and_half_open_boundaries(client):
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("w1", "ROOT", 10, 20, value=1.0, key="kr1"), "BR")
+
+    body = _compare(client).json()
+    assert body["differs"] is True
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 10, "left_only"),
+        (10, 20, "right_only"),
+    ]
+    first, second = body["intervals"]
+    assert first["left"] == {"state": "calibrated", "value": 1.0, "unit": "mm"}
+    assert first["right"] is None
+    assert second["left"] is None
+    assert second["right"] == {"state": "calibrated", "value": 1.0, "unit": "mm"}
+
+
+def test_compare_value_mismatch_on_value_and_unit(client):
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("v2", "v1", 10, 20, value=2.0, key="kl2"), "BL")
+    # Same values but a different unit on [0,10); different value on [10,20).
+    _post_to(
+        client,
+        _event("w1", "ROOT", 0, 10, value=1.0, unit="cm", key="kr1"),
+        "BR",
+    )
+    _post_to(client, _event("w2", "w1", 10, 20, value=3.0, key="kr2"), "BR")
+
+    body = _compare(client).json()
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 10, "value_mismatch"),
+        (10, 20, "value_mismatch"),
+    ]
+    assert body["intervals"][0]["left"]["unit"] == "mm"
+    assert body["intervals"][0]["right"]["unit"] == "cm"
+    assert body["intervals"][1]["left"]["value"] == 2.0
+    assert body["intervals"][1]["right"]["value"] == 3.0
+
+
+def test_compare_state_mismatch_calibrated_vs_withdrawn(client):
+    _post_to(client, _event("v1", "ROOT", 0, 100, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("w1", "ROOT", 0, 100, value=1.0, key="kr1"), "BR")
+    _post_to(
+        client,
+        _event("w2", "w1", 30, 70, withdrawn=True, value=None, key="kr2"),
+        "BR",
+    )
+
+    body = _compare(client).json()
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 30, "equal"),
+        (30, 70, "state_mismatch"),
+        (70, 100, "equal"),
+    ]
+    mid = body["intervals"][1]
+    assert mid["left"] == {"state": "calibrated", "value": 1.0, "unit": "mm"}
+    assert mid["right"] == {"state": "withdrawn", "value": None, "unit": None}
+
+
+def test_compare_withdrawn_on_both_sides_is_equal(client):
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    _post_to(
+        client,
+        _event("v2", "v1", 0, 10, withdrawn=True, value=None, key="kl2"),
+        "BL",
+    )
+    _post_to(client, _event("w1", "ROOT", 0, 10, value=9.0, key="kr1"), "BR")
+    _post_to(
+        client,
+        _event("w2", "w1", 0, 10, withdrawn=True, value=None, key="kr2"),
+        "BR",
+    )
+
+    body = _compare(client).json()
+    assert [(i["kind"], i["left"]["state"], i["right"]["state"])
+            for i in body["intervals"]] == [("equal", "withdrawn", "withdrawn")]
+    assert body["differs"] is False
+
+
+def test_compare_uncovered_hole_on_both_sides_is_equal(client):
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("v2", "v1", 20, 30, value=2.0, key="kl2"), "BL")
+    _post_to(client, _event("w1", "ROOT", 0, 10, value=1.0, key="kr1"), "BR")
+    _post_to(client, _event("w2", "w1", 20, 30, value=2.0, key="kr2"), "BR")
+
+    body = _compare(client).json()
+    assert [(i["start_ns"], i["end_ns"], i["kind"]) for i in body["intervals"]] == [
+        (0, 10, "equal"),
+        (10, 20, "equal"),
+        (20, 30, "equal"),
+    ]
+    hole = body["intervals"][1]
+    assert hole["left"] is None and hole["right"] is None
+    assert body["differs"] is False
+
+
+def test_compare_incomplete_due_to_gaps_and_invalid(client):
+    # Left: child waiting on a missing parent (backfillable gap).
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("v3", "v2", 0, 10, value=3.0, key="kl3"), "BL")
+    # Right: a parent cycle (invalid revisions).
+    _post_to(client, _event("w1", "ROOT", 0, 10, value=1.0, key="kr1"), "BR")
+    _post_to(client, _event("c1", "c2", 0, 5, value=1.0, key="kc1"), "BR")
+    _post_to(client, _event("c2", "c1", 0, 5, value=1.0, key="kc2"), "BR")
+
+    body = _compare(client).json()
+    assert body["incomplete"] is True
+    reasons = {(r["side"], r["reason"]): r for r in body["incomplete_reasons"]}
+    gap = reasons[("left", "gaps")]
+    assert gap["batch_id"] == "BL"
+    assert gap["missing_revision_ids"] == ["v2"]
+    assert gap["awaited_by"] == ["v3"]
+    inv = reasons[("right", "invalid_revisions")]
+    assert inv["batch_id"] == "BR"
+    assert inv["invalid_revision_ids"] == ["c1", "c2"]
+    # The diff itself is still computed from the grounded folds.
+    assert body["intervals"] == [
+        {
+            "start_ns": 0,
+            "end_ns": 10,
+            "kind": "equal",
+            "left": {"state": "calibrated", "value": 1.0, "unit": "mm"},
+            "right": {"state": "calibrated", "value": 1.0, "unit": "mm"},
+        }
+    ]
+
+
+def test_compare_incomplete_resolves_after_backfill(client):
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    _post_to(client, _event("v2", "ghost", 0, 10, value=2.0, key="kl2"), "BL")
+    _post_to(client, _event("w1", "ROOT", 0, 10, value=2.0, key="kr1"), "BR")
+
+    body = _compare(client).json()
+    assert body["incomplete"] is True
+    assert body["intervals"][0]["kind"] == "value_mismatch"
+
+    _post_to(client, _event("ghost", "ROOT", 0, 10, value=9.0, key="kl0"), "BL")
+    body = _compare(client).json()
+    assert body["incomplete"] is False
+    assert body["incomplete_reasons"] == []
+    # Backfilled chain: v2 (depth 1) now overwrites ghost on [0,10).
+    assert body["intervals"][0]["kind"] == "equal"
+
+
+def test_compare_unknown_batch_or_sensor_404(client):
+    assert _compare(client, left="NOPE").status_code == 404
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    assert _compare(client, right="NOPE").status_code == 404
+    # Right batch does not exist yet.
+    assert _compare(client).status_code == 404
+    _post_to(client, _event("w1", "ROOT", 0, 10, value=1.0, key="kr1"), "BR")
+    assert _compare(client, sensor="SX").status_code == 404
+    assert _compare(client).status_code == 200
+
+
+def test_compare_rejects_invalid_params(client):
+    _post_to(client, _event("v1", "ROOT", 0, 10, value=1.0, key="kl1"), "BL")
+    base = "/api/v1/batches/compare"
+    # Missing query parameters.
+    assert client.get(base).status_code == 422
+    assert client.get(base, params={"left_batch_id": "BL"}).status_code == 422
+    # Empty parameter values.
+    assert _compare(client, left="").status_code == 422
+    assert _compare(client, sensor="").status_code == 422
+
+
+def test_compare_is_deterministic_across_arrival_orders(client):
+    def submit(batch, events):
+        for e in events:
+            resp = _post_to(client, e, batch)
+            assert resp.status_code == 200
+
+    left_events = [
+        _event("r", "ROOT", 0, 100, value=1.0, key="kl0"),
+        _event("a", "r", 0, 50, value=2.0, key="kl1"),
+        _event("b", "r", 25, 75, withdrawn=True, value=None, key="kl2"),
+    ]
+    right_events = [
+        _event("x", "ROOT", 0, 100, value=1.0, key="kr0"),
+        _event("y", "x", 0, 25, value=2.0, key="kr1"),
+        _event("z", "x", 50, 75, value=3.0, key="kr2"),
+    ]
+    submit("BL", left_events)
+    submit("BR", right_events)
+    first = _compare(client).json()
+
+    client.post("/admin/reset")
+    submit("BL", list(reversed(left_events)))
+    submit("BR", list(reversed(right_events)))
+    assert _compare(client).json() == first
